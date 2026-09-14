@@ -1,0 +1,12 @@
+**/test_env
+**/.venv
+**/.git
+
+**/__pycache__
+**/tempCodeRunnerFile.py
+**/test.py 
+**/test.ipynb
+**/deploy.ps1
+**/jamdict.db
+
+awesome-align/

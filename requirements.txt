@@ -1,0 +1,24 @@
+# 1. Direct pip to the CPU-only repository (MUST be at the top)
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# 2. List the core packages (pip will now find the +cpu versions)
+torch
+tokenizers>=0.5.2
+tqdm
+numpy
+pandas
+ytmusicapi
+selenium
+beautifulsoup4
+fugashi
+unidic-lite
+spacy
+pyvirtualdisplay
+google-cloud-firestore
+fastapi
+uvicorn
+jamdict
+sentence_transformers
+openai
+google-genai
+ddgs
