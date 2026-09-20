@@ -8,6 +8,4 @@
 **/deploy.ps1
 **/jamdict.db
 
-**/*.ipynb
-
 awesome-align/
