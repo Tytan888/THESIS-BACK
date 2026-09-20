@@ -270,10 +270,13 @@ def filter_alignments_labse(filtered_df, threshold=0.60, verbose_debug=False):
         alignments = a.split()
 
         pairs = []
+        original_align_map = {} # Track original strings to preserve :uid
         for align in alignments:
-            src, tgt = map(int, align.split("-"))
+            base_align = align.split(":")[0] # Drop the :uid for parsing
+            src, tgt = map(int, base_align.split("-"))
             if src < len(jp_words) and tgt < len(en_words):
                 pairs.append((src, tgt))
+                original_align_map[(src, tgt)] = align
 
         groups = combine_bidirectional_overlaps(pairs)
         surviving_alignments = []
@@ -291,7 +294,7 @@ def filter_alignments_labse(filtered_df, threshold=0.60, verbose_debug=False):
                 for s in s_indices:
                     for t in t_indices:
                         if (s, t) in pairs:
-                            surviving_alignments.append(f"{s}-{t}")
+                            surviving_alignments.append(original_align_map[(s, t)])
             else:
                 if verbose_debug:
                     log_gcp("DEBUG", f"Dropped group (Low Semantics): JP '{jp_chunk}' -> EN '{en_chunk}' (Score: {similarity:.2f})\nJP '{j}'\nEN '{e}'\n")
@@ -644,24 +647,39 @@ def run_alignment_pipeline(clean_df, filter_llms=["gpt-4o-mini"], verbose_pos=Fa
     if len(vocab_map) < 5:
         log_gcp("WARNING", "All translation sources failed to yield a matching result...", query=vocab_map)
         raise AlignmentError("Song didn't have enough vocab...", "EXPT_NOT_ENOUGH_VOCAB")
-    elif len(vocab_map) > 15:
-        vocab_map = random.sample(vocab_map, 15)
-        vocab_uids = [vocab["uid"] for vocab in vocab_map]
-
-        for idx in final_df.index:
-            a = final_df.at[idx, "alignments"]
+    else:
+        strict_df = filter_alignments_labse(final_df, threshold=0.75)
+        
+        surviving_uids = set()
+        for a in strict_df["alignments"]:
+            if a and str(a).strip() != "":
+                for align in a.split():
+                    if ":" in align:
+                        surviving_uids.add(int(align.split(":")[1]))
+                        
+        new_vocab_map = [v for v in vocab_map if v["uid"] in surviving_uids]
+        
+        if len(new_vocab_map) < 10:
+            active_df = final_df
+            active_vocab_map = vocab_map
+        else:
+            active_df = strict_df
+            active_vocab_map = new_vocab_map
             
+        if len(active_vocab_map) > 15:
+            active_vocab_map = random.sample(active_vocab_map, 15)
+            
+        final_uids = [v["uid"] for v in active_vocab_map]
+
+        for idx in active_df.index:
+            a = active_df.at[idx, "alignments"]
             if not a or str(a).strip() == "":
                 continue
 
-            alignments = a.split()
-            surviving_alignments = []
+            surviving_alignments = [
+                align for align in a.split() 
+                if int(align.split(":")[1]) in final_uids
+            ]
+            active_df.at[idx, "alignments"] = " ".join(surviving_alignments)
 
-            for alignment in alignments:
-                uid = int(alignment.split(":")[1])
-                if uid in vocab_uids:
-                    surviving_alignments.append(alignment)
-            
-            final_df.at[idx, "alignments"] = " ".join(surviving_alignments)
-
-    return final_df, vocab_map
+        return active_df, active_vocab_map

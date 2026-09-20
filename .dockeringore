@@ -5,8 +5,9 @@
 **/__pycache__
 **/tempCodeRunnerFile.py
 **/test.py 
-**/test.ipynb
 **/deploy.ps1
 **/jamdict.db
+
+**/*.ipynb
 
 awesome-align/

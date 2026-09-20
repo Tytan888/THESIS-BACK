@@ -17,6 +17,10 @@ from urllib.parse import quote
 from pyvirtualdisplay import Display
 import unicodedata
 from ddgs import DDGS
+import requests
+import functools
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from logger import log_gcp
 
@@ -75,7 +79,10 @@ def scrape_baseline_youtube(video_id: str):
     raw_proxies = [
         os.environ.get("JP_PROXY_URL"),
         os.environ.get("PH_PROXY_URL_1"),
-        os.environ.get("PH_PROXY_URL_2")
+        os.environ.get("PH_PROXY_URL_2"),
+        os.environ.get("PH_PROXY_URL_3"),
+        os.environ.get("PH_PROXY_URL_4"),
+        os.environ.get("PH_PROXY_URL_5"),
     ]
     proxies_list = [{"http": p, "https": p} for p in raw_proxies if p]
     proxies_list.append(None)
@@ -87,8 +94,23 @@ def scrape_baseline_youtube(video_id: str):
             log_gcp("INFO", "Proxy configuration loaded.", video_id=video_id, proxy_url=proxies["http"])
         else:
             log_gcp("WARNING", "No proxy configuration found. Proceeding without proxy.", video_id=video_id)
+
+        s = requests.Session()
+        
+        retry_strategy = Retry(
+            total=3, 
+            backoff_factor=1.5, 
+            status_forcelist=[413, 429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        
+        s.request = functools.partial(s.request, timeout=(40, 60))
     
-        ytmusic = YTMusic(location=location, language=language, proxies=proxies)
+        ytmusic = YTMusic(location=location, language=language, proxies=proxies, requests_session=s)
 
         try:
             try:
