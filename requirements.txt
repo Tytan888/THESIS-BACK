@@ -22,3 +22,4 @@ sentence_transformers
 openai
 google-genai
 ddgs
+syncedlyrics

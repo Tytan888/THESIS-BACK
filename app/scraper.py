@@ -21,6 +21,10 @@ import requests
 import functools
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import syncedlyrics
+import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("syncedlyrics").setLevel(logging.WARNING)
 
 from logger import log_gcp
 
@@ -29,7 +33,7 @@ class ScraperError(Exception):
         super().__init__(message)
         self.error_code = error_code
 
-def _is_match_above_threshold(s1: str, s2: str, threshold: float = 80.0) -> bool:
+def _is_match_above_threshold(s1: str, s2: str, threshold: float = 50.0) -> bool:
     s1 = unicodedata.normalize('NFKC', s1)
     s2 = unicodedata.normalize('NFKC', s2)
     s1 = s1.lower()
@@ -70,7 +74,7 @@ def _get_headless_driver():
 
 # STEP 1: Get the lyrics using YouTube Music API. If not found, use SyncedLyrics API. If still not found, return None.
 
-def scrape_baseline_youtube(video_id: str):
+def scrape_baseline_youtube(video_id: str, manual_synced=""):
     location = "PH"
     language = "en"
 
@@ -88,6 +92,12 @@ def scrape_baseline_youtube(video_id: str):
     proxies_list.append(None)
 
     error_thrown = False
+    
+    # NEW: Variables to track state across proxy attempts for the fallback
+    non_synced_text = ""
+    track_length_ms = 0
+    final_title = ""
+    final_artists = ""
 
     for proxies in proxies_list:
         if proxies:
@@ -96,18 +106,14 @@ def scrape_baseline_youtube(video_id: str):
             log_gcp("WARNING", "No proxy configuration found. Proceeding without proxy.", video_id=video_id)
 
         s = requests.Session()
-        
         retry_strategy = Retry(
-            total=3, 
-            backoff_factor=1.5, 
+            total=3, backoff_factor=1.5, 
             status_forcelist=[413, 429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
-        
         adapter = HTTPAdapter(max_retries=retry_strategy)
         s.mount("http://", adapter)
         s.mount("https://", adapter)
-        
         s.request = functools.partial(s.request, timeout=(40, 60))
     
         ytmusic = YTMusic(location=location, language=language, proxies=proxies, requests_session=s)
@@ -117,33 +123,44 @@ def scrape_baseline_youtube(video_id: str):
                 watch_playlist = ytmusic.get_watch_playlist(videoId=video_id)
             except Exception as e:
                 log_gcp("WARNING", f"Song could not be accessed. May be an invalid video_id...", video_id=video_id, location=location, language=language, traceback=traceback.format_exc())
-                # raise ScraperError("Song could not be accessed. May be an invalid video_id...", "ERR_YT_NOT_FOUND")
                 continue
 
             track_info = watch_playlist['tracks'][0]
             title = track_info.get('title', 'Unknown Title')
+            final_title = title
 
             artists_data = track_info.get('artists', [])
             artists = ", ".join([a['name'] for a in artists_data]) if artists_data else "Unknown Artist"
+            final_artists = artists
+
+            # NEW: Extract track length to use for the final end_time in the fallback
+            if track_info.get('length'):
+                parts = track_info['length'].split(':')
+                if len(parts) == 2:
+                    track_length_ms = int((int(parts[0]) * 60 + int(parts[1])) * 1000)
 
             log_gcp("DEBUG", f"Attempting to pull lyrics for '{title}' by {artists}", video_id=video_id)
 
             lyrics_id = watch_playlist.get('lyrics')
             if not lyrics_id:
                 log_gcp("WARNING", "No lyrics returned for this song...", video_id=video_id)
-                # raise ScraperError("No lyrics returned for this song...", "EXPT_YT_NO_LYRICS")
                 continue
             
             try:
                 lyrics_data = ytmusic.get_lyrics(lyrics_id, timestamps=True)
             except Exception as e:
                 log_gcp("WARNING", f"Lyrics found, but they are not time-synced...", video_id=video_id, traceback=traceback.format_exc())
-                # raise ScraperError("Lyrics found, but they are not time-synced...", "EXPT_YT_NOT_SYNCED")
+                # NEW: Save the non-timestamped lyrics to compare later in the fallback
+                try:
+                    ns_data = ytmusic.get_lyrics(lyrics_id, timestamps=False)
+                    if ns_data and 'lyrics' in ns_data:
+                        non_synced_text = ns_data['lyrics']
+                except Exception:
+                    pass
                 continue
 
             if not lyrics_data:
                 log_gcp("WARNING", "No lyrics data returned for this song...", video_id=video_id)
-                # raise ScraperError("No lyrics returned for this song...", "EXPT_YT_NO_LYRICS")
                 continue
 
             df = pd.DataFrame(columns=['jp_baseline', 'start_time', 'end_time'])
@@ -155,17 +172,80 @@ def scrape_baseline_youtube(video_id: str):
 
         except Exception as e:
             log_gcp("ERROR", f"YT Music extraction failed... {e}", traceback=traceback.format_exc(), video_id=video_id)
-            # raise ScraperError("YT Music extraction failed...", "ERR_YT_API_GENERIC_CRASH")
             error_thrown = True
             continue
 
+    # NEW: Fallback Logic Execution
+    if non_synced_text:
+        log_gcp("INFO", "Attempting syncedlyrics fallback...", video_id=video_id)
+        
+        # Clean the title of brackets, (feat. ...), and multi-language splits
+        clean_title = re.sub(r'[\(（\[【].*?[\)）\]】]', '', final_title).strip()
+        clean_title = re.sub(r'\(feat\..*?\)', '', clean_title, flags=re.IGNORECASE).strip()
+        primary_title = clean_title.split(" - ")[0].strip()
+
+        search_query_full = f"{primary_title} {final_artists}".strip()
+        search_query_title = f"{primary_title}".strip()
+        search_query_full_2 = f"{primary_title} {final_artists}".strip()
+        search_query_title_2 = f"{primary_title}".strip()
+
+        lrc_string = syncedlyrics.search(search_query_full, synced_only=True, providers=["Lrclib"], lang="en")
+        if not lrc_string:
+            lrc_string = syncedlyrics.search(search_query_title, synced_only=True, providers=["Lrclib"], lang="en")
+        if not lrc_string:
+            lrc_string = syncedlyrics.search(search_query_full_2, synced_only=True, providers=["Lrclib"], lang="en")
+        if not lrc_string:
+            lrc_string = syncedlyrics.search(search_query_title_2, synced_only=True, providers=["Lrclib"], lang="en")
+        if not lrc_string and manual_synced.strip():
+            lrc_string = syncedlyrics.search(manual_synced, synced_only=True, providers=["Lrclib"], lang="en")
+            
+        if lrc_string:
+            parsed_lines = []
+            
+            # Parse LRC string into (text, start_time_ms)
+            for line in lrc_string.split('\n'):
+                match = re.match(r'\[(\d{2}:\d{2}\.\d{2,3})\]\s*(.*)', line)
+                if match:
+                    m, s = match.group(1).split(':')
+                    ms = int((int(m) * 60 + float(s)) * 1000)
+                    text = match.group(2).strip()
+                    if text:
+                        parsed_lines.append((text, ms))
+                        
+            synced_text = "".join([t for t, _ in parsed_lines])
+            match_pct = _get_match_value(non_synced_text, synced_text)
+            
+            if match_pct >= 80:
+                log_gcp("INFO", f"Fallback lyrics match threshold met ({match_pct:.2f}%). Generating df.", video_id=video_id)
+                df = pd.DataFrame(columns=['jp_baseline', 'start_time', 'end_time'])
+                
+                # Calculate end times
+                for i in range(len(parsed_lines)):
+                    text, start_time = parsed_lines[i]
+                    if i < len(parsed_lines) - 1:
+                        end_time = parsed_lines[i+1][1]
+                    else:
+                        # Use track length if it exceeds start_time, otherwise pad by 5 seconds
+                        end_time = track_length_ms if track_length_ms > start_time else start_time + 5000
+                        
+                    df.loc[len(df)] = [text, start_time, end_time]
+                    
+                return df, final_title, final_artists
+            else:
+                log_gcp("WARNING", f"Fallback lyrics failed match threshold ({match_pct:.2f}%).", video_id=video_id)
+        else:
+            log_gcp("WARNING", f"SyncedLyrics failed to find synced lyrics.", video_id=video_id)
+
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("syncedlyrics").setLevel(logging.WARNING)
+        
+    # If the fallback failed or wasn't triggered, raise the appropriate original exception
     if error_thrown:
         raise ScraperError("YT Music extraction failed...", "ERR_YT_API_GENERIC_CRASH")
     else:
         raise ScraperError("Lyrics couldn't be found or weren't time-synced.", "EXPT_YT_BAD_LYRICS")
     
 # --- STEP 2: TRANSLATION SCRAPERS ---
-
 def _is_valid_umatime_url(url: str) -> bool:
     prefix = "https://www.utatime.com/global/lyrics/"
     if not url.startswith(prefix):
@@ -189,13 +269,13 @@ def _scrape_utatime(title: str, artists: str, baseline_text: str):
                 search_box.send_keys(search_query)
             except TimeoutException:
                 log_gcp("WARNING", "Timeout: Search box ('input.search-input') not found. Site UI may have changed.")
-                return None
+                return []
 
             try:
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".search-results-meta")))
             except TimeoutException:
                 log_gcp("WARNING", "Timeout: Search results ('.search-result') failed to load. Possibly no results or blocked.")
-                return None
+                return []
             
             soup = BeautifulSoup(driver.page_source, "html.parser")
             
@@ -206,227 +286,250 @@ def _scrape_utatime(title: str, artists: str, baseline_text: str):
             return links
         except Exception as e:
             log_gcp("ERROR", f"UtaTime search phase failed... {e}", traceback=traceback.format_exc())
-            return None
+            return []
         finally:
             if driver:
                 driver.quit()
             if display:
                 display.stop()
 
-    links = []
-    links = _gather_utatime_links(f"{title} {artists}")
+    clean_title = re.sub(r'[\(（\[【].*?[\)）\]】]', '', title).strip()
+    primary_title = clean_title.split(" - ")[0].strip()
+
+    # 2. Build prioritized search tiers
+    search_tiers = [
+        f"{primary_title} {artists}".strip(),
+        f"{title} {artists}".strip(),
+    ]
     
-    if not links:
-        links = _gather_utatime_links(f"{title}")
+    # Deduplicate tiers while preserving order
+    search_tiers = list(dict.fromkeys([q for q in search_tiers if q]))
 
-    if not links:
-        log_gcp("WARNING", "No search results found on Lyrical Nonsense.")
-        return None, None
-
-    for link in links[:3]:
-        log_gcp("DEBUG", f"Extracting from: {link}")
+    for query in search_tiers:
+        links = _gather_utatime_links(query)
         
-        ext_driver, ext_display = _get_headless_driver()
-        
-        try:
-            ext_driver.get(link)
-            wait = WebDriverWait(ext_driver, 10)
-            
-            try:
-                wait.until(EC.presence_of_element_located((By.ID, "Romaji")))
-            except TimeoutException:
-                log_gcp("WARNING", f"Timeout: 'Romaji' div not found on {link}. Skipping to next link.")
-                continue
-
-            soup = BeautifulSoup(ext_driver.page_source, "html.parser")
-            
-            def get_lines(div_id):
-                div = soup.find("div", id=lambda x: x and div_id in x)
-
-                if not div:
-                    return []
-                
-                for rt_span in div.find_all("span", class_="rt"):
-                    rt_span.decompose()
-
-                return [span.get_text(strip=True) for span in div.find_all("span", class_="line-text")] if div else []
-
-            ro_lines = get_lines("Romaji")
-            jp_lines = get_lines("Original")
-            en_lines = get_lines("English") or get_lines("EnglishOff")
-
-            if not (ro_lines and jp_lines and en_lines):
-                log_gcp("DEBUG", "One of the translations was missing, skipping this result.")
-                continue
-            if not _is_match_above_threshold("".join(jp_lines), "".join(baseline_text), 80):
-                log_gcp("DEBUG", f"Baseline text did not match well with the Japanese translation ({_get_match_value(''.join(jp_lines), ''.join(baseline_text)):.2f}%), skipping this result.")
-                continue
-            if len(jp_lines) != len(en_lines) or len(jp_lines) != len(ro_lines):
-                    log_gcp("DEBUG", f"Line count mismatch (JP: {len(jp_lines)} | EN: {len(en_lines)} | RO: {len(ro_lines)}). Skipping.")
-                    continue
-
-            log_gcp("INFO", "Successfully extracted UtaTime translations.")
-            return pd.DataFrame({'jp_translation': jp_lines, 'en_translation': en_lines, 'ro_translation': ro_lines}), link
-
-        except Exception as e:
-            log_gcp("WARNING", f"Failed extracting {link}... {e}")
-            continue 
-            
-        finally:
-            if ext_driver:
-                ext_driver.quit()
-            if ext_display:
-                ext_display.stop()
-
-    # If the loop finishes and none passed the tests:
-    log_gcp("WARNING", "All search results on UtaTime failed verification.")
-    return None, None
-
-def _scrape_lyrics_translate(search_query: str, baseline_text: str):
-    log_gcp("INFO", "Attempting Lyrics Translate scrape...", query=search_query)
-    driver, display = _get_headless_driver()
-    
-    try:
-        encoded_search = quote(search_query)
-        driver.get(f"https://lyricstranslate.com/en/site-search?query={encoded_search}")
-
-        wait = WebDriverWait(driver, 10)
-        
-        try:
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.search-res__body")))
-        except TimeoutException:
-            log_gcp("WARNING", "Timeout: Search results container not found. Site UI may have changed.")
-            return None, None
-
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        songs_div = soup.find("div", class_="_songs")
-
-        links = []
-        if songs_div:
-            items = songs_div.find_all("div", class_="block-search-res__item")
-            
-            for item in items:
-                title_link = item.find("a", class_="block-1-table__title")
-                
-                if title_link and title_link.get("href"):
-                    href = title_link["href"]
-                    if href.startswith("/"):
-                        href = "https://lyricstranslate.com" + href
-                    
-                    if href not in links:
-                        links.append(href)
-
         if not links:
-            log_gcp("WARNING", "No search results found on Lyrics Translate.")
-            return None, None
+            log_gcp("DEBUG", f"No results found for tier '{query}'. Moving to next tier.")
+            continue
 
         for link in links[:3]:
             log_gcp("DEBUG", f"Extracting from: {link}")
-            driver.get(link)
-
-            try:
-                wait.until(EC.presence_of_element_located((By.ID, "song-body")))
-            except TimeoutException:
-                log_gcp("WARNING", f"Timeout: 'song-body' div not found on {link}. Skipping to next link.")
-                continue
+            
+            ext_driver, ext_display = _get_headless_driver()
             
             try:
-                translit_toggle = wait.until(EC.element_to_be_clickable(
-                    (By.CSS_SELECTOR, "a.js-song-translit")
-                ))
+                ext_driver.get(link)
+                wait = WebDriverWait(ext_driver, 10)
                 
-                driver.execute_script("arguments[ 0 ].scrollIntoView({block: 'center'});", translit_toggle)
-                time.sleep(0.5) 
-                
-                translit_toggle.click()
-                time.sleep(0.5)
-                
-            except TimeoutException:
-                log_gcp("WARNING", f"Timeout: Transliteration toggle button not found/clickable on {link}. Skipping.")
-                continue
-            except Exception as e:
-                log_gcp("WARNING", f"Failed to click transliteration toggle... {e}")
-                continue
-                
-            try:
-                translit_option = wait.until(EC.element_to_be_clickable(
-                    (By.CSS_SELECTOR, 'div[data-more-content="transliterations_overlay"] a.js-translit-link')
-                ))
-                
-                driver.execute_script("arguments[ 0 ].click();", translit_option)
-            except TimeoutException:
-                log_gcp("WARNING", f"Timeout: Romanization option not found in dropdown on {link}. Skipping.")
-                continue
-
-            try:
-                wait.until(EC.presence_of_element_located((By.ID, "song-transliteration")))
-                wait.until(lambda d: d.find_element(By.ID, "song-transliteration").text.strip() != "")
-            except TimeoutException:
-                log_gcp("WARNING", f"Timeout: Transliteration text failed to load/populate on {link}. Skipping.")
-                continue
-
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-
-            def get_lines(div_id):
-                song_body = soup.find("div", id=div_id)
-                lines_list = []
-                if song_body:
-                    divs = song_body.find_all("div", class_=re.compile(r"ll-\d+-\d+"))
-                    last_x = None
-                    for div in divs:
-                        match = re.match(r"ll-(\d+)-(\d+)", div["class"][ 0 ])
-                        if match:
-                            x = int(match.group(1))
-                            if last_x is not None and x != last_x:
-                                lines_list.append("")
-                            lines_list.append(div.get_text(strip=True))
-                            last_x = x
-                return lines_list
-
-            ro_lines = get_lines("song-transliteration")
-            jp_lines = get_lines("song-body")
-            
-            # Find English translation link
-            en_lines = []
-            eng_link = None
-            for h in soup.find_all("h3", class_="title"):
-                if h.get_text(strip=True).lower() == "translations":
-                    sibling = h.find_next_sibling("div", class_="tags__items")
-                    while sibling:
-                        if "english" in sibling.get_text(strip=True).lower():
-                            a_tag = sibling.find("a")
-                            if a_tag and a_tag.get("href"):
-                                eng_link = "https://lyricstranslate.com" + a_tag["href"] if a_tag["href"].startswith("/") else None
-                                break
-                        sibling = sibling.find_next_sibling("div", class_="slist")
-                    break 
-
-            if eng_link:
-                driver.get(eng_link)
                 try:
-                    wait.until(EC.presence_of_element_located((By.ID, "translation-body")))
-                    soup = BeautifulSoup(driver.page_source, "html.parser")
-                    en_lines = get_lines("translation-body")
+                    wait.until(EC.presence_of_element_located((By.ID, "Romaji")))
                 except TimeoutException:
-                    log_gcp("WARNING", f"Timeout: 'translation-body' failed to load on English page for {link}. Skipping.")
+                    log_gcp("WARNING", f"Timeout: 'Romaji' div not found on {link}. Skipping to next link.")
                     continue
 
-            if not (ro_lines and jp_lines and en_lines):
-                log_gcp("DEBUG", "Missing translation columns (ro, jp, or en). Skipping to next link.")
-                continue
-            if not _is_match_above_threshold("".join(jp_lines), "".join(baseline_text), 80):
-                log_gcp("DEBUG", f"Baseline text did not match well with the Japanese translation ({_get_match_value(''.join(jp_lines), ''.join(baseline_text)):.2f}%), skipping this result.")
-                continue
-            if len(jp_lines) != len(en_lines) or len(jp_lines) != len(ro_lines):
+                soup = BeautifulSoup(ext_driver.page_source, "html.parser")
+                
+                def get_lines(div_id):
+                    div = soup.find("div", id=lambda x: x and div_id in x)
+
+                    if not div:
+                        return []
+                    
+                    for rt_span in div.find_all("span", class_="rt"):
+                        rt_span.decompose()
+
+                    return [span.get_text(strip=True) for span in div.find_all("span", class_="line-text")] if div else []
+
+                ro_lines = get_lines("Romaji")
+                jp_lines = get_lines("Original")
+                en_lines = get_lines("English") or get_lines("EnglishOff")
+
+                if not (ro_lines and jp_lines and en_lines):
+                    log_gcp("DEBUG", "One of the translations was missing, skipping this result.")
+                    continue
+                    
+                if not _is_match_above_threshold("".join(jp_lines), "".join(baseline_text)):
+                    match_val = _get_match_value("".join(jp_lines), "".join(baseline_text))
+                    log_gcp("DEBUG", f"Baseline text did not match well with the Japanese translation ({match_val:.2f}%), skipping this result.")
+                    continue
+                    
+                if len(jp_lines) != len(en_lines) or len(jp_lines) != len(ro_lines):
                     log_gcp("DEBUG", f"Line count mismatch (JP: {len(jp_lines)} | EN: {len(en_lines)} | RO: {len(ro_lines)}). Skipping.")
                     continue
 
-            log_gcp("INFO", "Successfully extracted Lyrics Translate translations.")
-            return pd.DataFrame(
-                {'jp_translation': jp_lines, 'en_translation': en_lines, 'ro_translation': ro_lines}
-            ).fillna(""), link
-        
-        log_gcp("WARNING", "All Lyrics Translate links failed validation checks.")
+                log_gcp("INFO", "Successfully extracted UtaTime translations.")
+                return pd.DataFrame({'jp_translation': jp_lines, 'en_translation': en_lines, 'ro_translation': ro_lines}), link
+
+            except Exception as e:
+                log_gcp("WARNING", f"Failed extracting {link}... {e}")
+                continue 
+                
+            finally:
+                if ext_driver:
+                    ext_driver.quit()
+                if ext_display:
+                    ext_display.stop()
+
+        log_gcp("INFO", f"All links for tier '{query}' failed validation. Proceeding to next search tier.")
+
+    # If the loop finishes and none passed the tests:
+    log_gcp("WARNING", "All search tiers and links on UtaTime failed verification.")
+    return None, None
+
+def _scrape_lyrics_translate(title: str, artists: str, baseline_text: str):
+    # 1. Clean title of (feat. ...) tags and split multi-language titles ("JP - EN")
+    clean_title = re.sub(r'\(feat\..*?\)', '', title, flags=re.IGNORECASE).strip()
+    primary_title = clean_title.split(" - ")[0].strip()
+
+    # 2. Build prioritized search tiers
+    search_tiers = [
+        primary_title,
+        f"{primary_title} {artists}".strip(),
+        title,
+        f"{title} {artists}".strip(),
+    ]
+    search_tiers = list(dict.fromkeys([q for q in search_tiers if q]))
+
+    driver, display = _get_headless_driver()
+    try:
+        wait = WebDriverWait(driver, 10)
+
+        def get_lines(soup_obj, div_id):
+            song_body = soup_obj.find("div", id=div_id)
+            lines_list = []
+            if song_body:
+                divs = song_body.find_all("div", class_=re.compile(r"ll-\d+-\d+"))
+                last_x = None
+                for div in divs:
+                    match = re.match(r"ll-(\d+)-(\d+)", div["class"][0])
+                    if match:
+                        x = int(match.group(1))
+                        if last_x is not None and x != last_x:
+                            lines_list.append("")
+                        lines_list.append(div.get_text(strip=True))
+                        last_x = x
+            return lines_list
+
+        for query in search_tiers:
+            log_gcp("INFO", "Attempting Lyrics Translate scrape...", query=query)
+            encoded_search = quote(query)
+            driver.get(f"https://lyricstranslate.com/en/site-search?query={encoded_search}")
+
+            try:
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.search-res__body, div.search-res__empty")))
+            except TimeoutException:
+                log_gcp("WARNING", f"Timeout: Search results container not found for query '{query}'.")
+                continue
+
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            songs_div = soup.find("div", class_="_songs")
+
+            links = []
+            if songs_div:
+                items = songs_div.find_all("div", class_="block-search-res__item")
+                for item in items:
+                    title_link = item.find("a", class_="block-1-table__title")
+                    if title_link and title_link.get("href"):
+                        href = title_link["href"]
+                        if href.startswith("/"):
+                            href = "https://lyricstranslate.com" + href
+                        if href not in links:
+                            links.append(href)
+
+            if not links:
+                log_gcp("DEBUG", f"No results found for tier '{query}'. Moving to next tier.")
+                continue
+
+            for link in links[:3]:
+                log_gcp("DEBUG", f"Extracting from: {link}")
+                driver.get(link)
+
+                try:
+                    wait.until(EC.presence_of_element_located((By.ID, "song-body")))
+                except TimeoutException:
+                    log_gcp("WARNING", f"Timeout: 'song-body' div not found on {link}. Skipping.")
+                    continue
+
+                # Open transliteration options
+                try:
+                    translit_toggle = wait.until(EC.element_to_be_clickable(
+                        (By.CSS_SELECTOR, "a.js-song-translit")
+                    ))
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", translit_toggle)
+                    time.sleep(0.5)
+                    translit_toggle.click()
+                    time.sleep(0.5)
+                except Exception as e:
+                    log_gcp("WARNING", f"Transliteration toggle unavailable on {link}: {e}")
+                    continue
+
+                # Select Romanization
+                try:
+                    translit_option = wait.until(EC.element_to_be_clickable(
+                        (By.CSS_SELECTOR, 'div[data-more-content="transliterations_overlay"] a.js-translit-link')
+                    ))
+                    driver.execute_script("arguments[0].click();", translit_option)
+                except TimeoutException:
+                    log_gcp("WARNING", f"Timeout: Romanization option not found in dropdown on {link}. Skipping.")
+                    continue
+
+                try:
+                    wait.until(EC.presence_of_element_located((By.ID, "song-transliteration")))
+                    wait.until(lambda d: d.find_element(By.ID, "song-transliteration").text.strip() != "")
+                except TimeoutException:
+                    log_gcp("WARNING", f"Timeout: Transliteration text failed to load on {link}. Skipping.")
+                    continue
+
+                song_soup = BeautifulSoup(driver.page_source, "html.parser")
+                ro_lines = get_lines(song_soup, "song-transliteration")
+                jp_lines = get_lines(song_soup, "song-body")
+
+                # Locate English translation link
+                en_lines = []
+                eng_link = None
+                for h in song_soup.find_all("h3", class_="title"):
+                    if h.get_text(strip=True).lower() == "translations":
+                        sibling = h.find_next_sibling("div", class_="tags__items")
+                        while sibling:
+                            if "english" in sibling.get_text(strip=True).lower():
+                                a_tag = sibling.find("a")
+                                if a_tag and a_tag.get("href"):
+                                    eng_link = "https://lyricstranslate.com" + a_tag["href"] if a_tag["href"].startswith("/") else None
+                                    break
+                            sibling = sibling.find_next_sibling("div", class_="slist")
+                        break
+
+                if eng_link:
+                    driver.get(eng_link)
+                    try:
+                        wait.until(EC.presence_of_element_located((By.ID, "translation-body")))
+                        trans_soup = BeautifulSoup(driver.page_source, "html.parser")
+                        en_lines = get_lines(trans_soup, "translation-body")
+                    except TimeoutException:
+                        log_gcp("WARNING", f"Timeout: 'translation-body' failed to load on {eng_link}. Skipping.")
+                        continue
+
+                if not (ro_lines and jp_lines and en_lines):
+                    log_gcp("DEBUG", f"Missing translation columns on {link}. Skipping.")
+                    continue
+
+                if not _is_match_above_threshold("".join(jp_lines), "".join(baseline_text)):
+                    match_val = _get_match_value("".join(jp_lines), "".join(baseline_text))
+                    log_gcp("DEBUG", f"Baseline mismatch on {link} ({match_val:.2f}%). Skipping.")
+                    continue
+
+                if len(jp_lines) != len(en_lines) or len(jp_lines) != len(ro_lines):
+                    log_gcp("DEBUG", f"Line count mismatch (JP: {len(jp_lines)} | EN: {len(en_lines)} | RO: {len(ro_lines)}). Skipping.")
+                    continue
+
+                log_gcp("INFO", "Successfully extracted Lyrics Translate translations.")
+                return pd.DataFrame(
+                    {'jp_translation': jp_lines, 'en_translation': en_lines, 'ro_translation': ro_lines}
+                ).fillna(""), link
+
+            log_gcp("INFO", f"All links for tier '{query}' failed validation. Proceeding to next search tier.")
+
+        log_gcp("WARNING", "All search tiers and links on Lyrics Translate failed verification.")
         return None, None
 
     except Exception as e:
@@ -539,7 +642,7 @@ def _scrape_animeliryca(title: str, artists: str, baseline_text: str):
                 log_gcp("DEBUG", "One of the translations was missing (ro, jp, or en), skipping this result.")
                 continue
             
-            if not _is_match_above_threshold("".join(jp_lines), "".join(baseline_text), 80):
+            if not _is_match_above_threshold("".join(jp_lines), "".join(baseline_text)):
                 match_val = _get_match_value("".join(jp_lines), "".join(baseline_text))
                 log_gcp("DEBUG", f"Baseline text did not match well with the Japanese translation ({match_val:.2f}%), skipping.")
                 continue
@@ -692,7 +795,7 @@ def _scrape_anime_song_lyrics(title: str, artists: str, baseline_text: str):
                     log_gcp("DEBUG", "Missing translation columns (ro, jp, or en). Skipping to next link.")
                     continue
                 
-                if not _is_match_above_threshold("".join(jp_lines), "".join(baseline_text), 80):
+                if not _is_match_above_threshold("".join(jp_lines), "".join(baseline_text)):
                     match_val = _get_match_value("".join(jp_lines), "".join(baseline_text))
                     log_gcp("DEBUG", f"Baseline text did not match well ({match_val:.2f}%). Skipping.")
                     continue
@@ -718,16 +821,165 @@ def _scrape_anime_song_lyrics(title: str, artists: str, baseline_text: str):
     log_gcp("WARNING", "All search tiers and links on AnimeSongLyrics failed verification.")
     return None, None
 
-def scrape_translations_router(title: str, artists: str, baseline_df: pd.DataFrame, scraper_order: list = ["lyrical_nonsense", "lyrics_translate", "animeliryca", "anime_song_lyrics"]):
+def _scrape_vocaloidlyrics(title: str, artists: str, baseline_text: str):
+    
+    def _gather_links(search_query: str):
+        log_gcp("INFO", "Attempting VocaloidLyrics site search...", query=search_query)
+        driver, display = _get_headless_driver()
+        links = []
+        
+        try:
+            encoded_search = quote(search_query)
+            driver.get(f"https://vocaloidlyrics.miraheze.org/w/index.php?search={encoded_search}")
+            wait = WebDriverWait(driver, 10)
+
+            try:
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.mw-search-result-heading, p.mw-search-nonefound")))
+            except TimeoutException:
+                log_gcp("WARNING", f"Timeout: Search results failed to load on VocaloidLyrics for query '{search_query}'.")
+                return []
+
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            for div in soup.find_all("div", class_="mw-search-result-heading"):
+                a_tag = div.find("a", href=True)
+                if a_tag:
+                    href = a_tag["href"]
+                    if href.startswith("/"):
+                        href = "https://vocaloidlyrics.miraheze.org" + href
+                    if href not in links:
+                        links.append(href)
+                        
+            return links
+        except Exception as e:
+            log_gcp("ERROR", f"VocaloidLyrics search phase failed... {e}", traceback=traceback.format_exc())
+            return []
+        finally:
+            if driver:
+                driver.quit()
+            if display:
+                display.stop()
+
+    # Clean YouTube suffixes like "(feat. HATSUNE MIKU)" and double Japanese/English titles
+    # MediaWiki search is highly strict; cleaning titles yields much better exact match results.
+    clean_title = re.sub(r'[\(（\[【].*?[\)）\]】]', '', title).strip()
+    clean_title = re.sub(r'\(feat\..*?\)', '', clean_title, flags=re.IGNORECASE).strip()
+    primary_title = clean_title.split(" - ")[0].strip()
+
+    # Search tiers: Title only, Title + Artist (using both original and cleaned titles)
+    search_tiers = [
+        f"Song Title {primary_title}",
+        f"Song Title {title}",
+        f"{primary_title} {artists}",
+        f"{title} {artists}"
+    ]
+    
+    # Deduplicate tiers while preserving order
+    search_tiers = list(dict.fromkeys(search_tiers))
+
+    for query in search_tiers:
+        links = _gather_links(query)
+        
+        if not links:
+            log_gcp("DEBUG", f"No links found for query: '{query}'. Moving to next tier.")
+            continue
+
+        for link in links[:3]:
+            log_gcp("DEBUG", f"Extracting from: {link}")
+            ext_driver, ext_display = _get_headless_driver()
+            
+            try:
+                ext_driver.get(link)
+                wait = WebDriverWait(ext_driver, 10)
+                
+                try:
+                    # Wait for either the lyrics table or the "Works" section to load
+                    target_element = wait.until(EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "table#lyrics-1, h2#Works")
+                    ))
+                    
+                    if target_element.get_attribute("id") == "Works":
+                        log_gcp("DEBUG", f"Found h2 id='Works' on {link} (likely a producer page). Skipping.")
+                        continue
+                        
+                except TimeoutException:
+                    log_gcp("WARNING", f"Timeout: 'lyrics-1' table not found on {link}. Skipping.")
+                    continue
+
+                soup = BeautifulSoup(ext_driver.page_source, "html.parser")
+                table = soup.find("table", id="lyrics-1")
+                
+                if not table:
+                    continue
+
+                header_tr = table.find("tr", class_="lyrics-table-header")
+                if not header_tr:
+                    log_gcp("DEBUG", f"No 'lyrics-table-header' found on {link}. Skipping.")
+                    continue
+                    
+                ths = header_tr.find_all("th")
+                th_classes = [cls for th in ths for cls in th.get("class", [])]
+                    
+                if not all(req in th_classes for req in ["lyrics-jp", "lyrics-rom", "lyrics-eng"]):
+                    log_gcp("DEBUG", f"Missing required language columns in header on {link}. Skipping.")
+                    continue
+
+                jp_lines, ro_lines, en_lines = [], [], []
+
+                for row in table.find_all("tr", class_="lyrics-row"):
+                    td_jp = row.find("td", class_="lyrics-jp")
+                    td_ro = row.find("td", class_="lyrics-rom")
+                    td_en = row.find("td", class_="lyrics-eng")
+                    
+                    if td_jp and td_ro and td_en:
+                        for rt_tag in td_jp.find_all("rt"):
+                            rt_tag.decompose()
+                            
+                        jp_lines.append(td_jp.get_text(separator=" ", strip=True))
+                        ro_lines.append(td_ro.get_text(separator=" ", strip=True))
+                        en_lines.append(td_en.get_text(separator=" ", strip=True))
+
+                if not (ro_lines and jp_lines and en_lines):
+                    log_gcp("DEBUG", "Missing translation columns (ro, jp, or en). Skipping to next link.")
+                    continue
+                
+                if not _is_match_above_threshold("".join(jp_lines), "".join(baseline_text)):
+                    match_val = _get_match_value("".join(jp_lines), "".join(baseline_text))
+                    log_gcp("DEBUG", f"Baseline text did not match well ({match_val:.2f}%). Skipping.")
+                    continue
+                    
+                if len(jp_lines) != len(en_lines) or len(jp_lines) != len(ro_lines):
+                    log_gcp("DEBUG", f"Line count mismatch (JP: {len(jp_lines)} | EN: {len(en_lines)} | RO: {len(ro_lines)}). Skipping.")
+                    continue
+
+                log_gcp("INFO", "Successfully extracted VocaloidLyrics translations.")
+                return pd.DataFrame({'jp_translation': jp_lines, 'en_translation': en_lines, 'ro_translation': ro_lines}), link
+
+            except Exception as e:
+                log_gcp("WARNING", f"Failed extracting {link}... {e}")
+                continue 
+            finally:
+                if ext_driver:
+                    ext_driver.quit()
+                if ext_display:
+                    ext_display.stop()
+        
+        log_gcp("INFO", f"All links for query '{query}' failed validation. Proceeding to next search tier.")
+
+    log_gcp("WARNING", "All search tiers and links on VocaloidLyrics failed verification.")
+    return None, None
+
+def scrape_translations_router(title: str, artists: str, baseline_df: pd.DataFrame, scraper_order: list = ["lyrical_nonsense", "lyrics_translate", "animeliryca", "vocaloidlyrics", "anime_song_lyrics"]):
     baseline_text = "".join(baseline_df['jp_baseline'].tolist())
 
     for scraper in scraper_order:
         if scraper == "lyrical_nonsense":
             df, link = _scrape_utatime(title, artists, baseline_text)
         elif scraper == "lyrics_translate":
-            df, link = _scrape_lyrics_translate(f"{title} {artists}", baseline_text)
+            df, link = _scrape_lyrics_translate(title, artists, baseline_text)
         elif scraper == "animeliryca":
             df, link = _scrape_animeliryca(title, artists, baseline_text)
+        elif scraper == "vocaloidlyrics":
+            df, link = _scrape_vocaloidlyrics(title, artists, baseline_text)
         elif scraper == "anime_song_lyrics":
             df, link = _scrape_anime_song_lyrics(title, artists, baseline_text)
 

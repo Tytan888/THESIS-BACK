@@ -10,3 +10,7 @@
 **/jamdict.db
 
 awesome-align/
+
+app/en.txt
+app/jp.txt
+app/ro.txt

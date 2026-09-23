@@ -659,7 +659,7 @@ def run_alignment_pipeline(clean_df, filter_llms=["gpt-4o-mini"], verbose_pos=Fa
                         
         new_vocab_map = [v for v in vocab_map if v["uid"] in surviving_uids]
         
-        if len(new_vocab_map) < 10:
+        if len(new_vocab_map) < 13:
             active_df = final_df
             active_vocab_map = vocab_map
         else:
@@ -681,5 +681,28 @@ def run_alignment_pipeline(clean_df, filter_llms=["gpt-4o-mini"], verbose_pos=Fa
                 if int(align.split(":")[1]) in final_uids
             ]
             active_df.at[idx, "alignments"] = " ".join(surviving_alignments)
+
+        # UNTESTED
+        # Recalculate first_seen_line based on the finalized alignments
+        updated_seen_lines = {}
+        for idx in active_df.index:
+            a = active_df.at[idx, "alignments"]
+            if not a or str(a).strip() == "":
+                continue
+            
+            for align in a.split():
+                if ":" in align:
+                    uid = int(align.split(":")[1])
+                    # Only record the first time we see the UID in the final dataframe
+                    if uid not in updated_seen_lines:
+                        updated_seen_lines[uid] = f"{idx}:{align}"
+
+        # Apply the corrected lines back to the vocab map
+        for vocab in active_vocab_map:
+            # vocab["uid"] is an int in the tuple/list, ensure types match
+            uid = int(vocab["uid"]) 
+            if uid in updated_seen_lines:
+                vocab["first_seen_line"] = updated_seen_lines[uid]
+        # --------------------------
 
         return active_df, active_vocab_map
