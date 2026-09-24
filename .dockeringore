@@ -7,5 +7,12 @@
 **/test.py 
 **/deploy.ps1
 **/jamdict.db
+**/en.txt
+**/ro.txt
+**/jp.txt
+**/batch_run_log*.txt
 
 awesome-align/
+
+**/*.ipynb
+**/*.ipynb_checkpoints

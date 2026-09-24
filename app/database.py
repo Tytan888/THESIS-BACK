@@ -8,7 +8,8 @@ db = firestore.Client(project=project_id)
 def update_song_status_to_error(video_id: str, error_code: str = None):
     try:
         doc_data = {
-            "status": "error"
+            "status": "error",
+            "finished_processing_by": firestore.SERVER_TIMESTAMP
         }
             
         if error_code is not None:
@@ -24,7 +25,11 @@ def update_song_status_to_error(video_id: str, error_code: str = None):
         
     except Exception as e:
         doc_ref = db.collection("songs").document(video_id)
-        doc_ref.set({"status": "error", "error_code": "ERR_DB_ERROR_UPDATE_CRASH"}, merge=True)
+        doc_ref.set({
+            "status": "error", 
+            "error_code": "ERR_DB_ERROR_UPDATE_CRASH",
+            "finished_processing_by": firestore.SERVER_TIMESTAMP
+        }, merge=True)
         log_gcp("ERROR", "Failed to update database...", video_id=video_id, traceback=traceback.format_exc())
 
 def save_pipeline_results(video_id: str, subtitles: list = None, vocab_map: list = None, translation_url: str = None):
@@ -37,7 +42,7 @@ def save_pipeline_results(video_id: str, subtitles: list = None, vocab_map: list
 
         if vocab_map:
             for vocab in vocab_map:
-                if op_count >= 485: # Lowered slightly to leave room for the song update AND the progress deletion
+                if op_count >= 485: 
                     batch.commit()
                     batch = db.batch()
                     op_count = 0
@@ -59,6 +64,7 @@ def save_pipeline_results(video_id: str, subtitles: list = None, vocab_map: list
             "vocab_list": [str(v["uid"]) for v in vocab_map] if vocab_map else [],
             "translation_url": translation_url,
             "error_code": firestore.DELETE_FIELD,
+            "finished_processing_by": firestore.SERVER_TIMESTAMP
         }
         
         batch.set(song_ref, song_data, merge=True)
@@ -73,7 +79,11 @@ def save_pipeline_results(video_id: str, subtitles: list = None, vocab_map: list
 
     except Exception as e:
         doc_ref = db.collection("songs").document(video_id)
-        doc_ref.set({"status": "error", "error_code": "ERR_DB_SAVING_CRASH"}, merge=True)
+        doc_ref.set({
+            "status": "error", 
+            "error_code": "ERR_DB_SAVING_CRASH",
+            "finished_processing_by": firestore.SERVER_TIMESTAMP
+        }, merge=True)
         log_gcp("ERROR", f"Failed to commit database updates: {e}", traceback=traceback.format_exc(), video_id=video_id)
         raise
 

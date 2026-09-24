@@ -74,106 +74,176 @@ def _get_headless_driver():
 
 # STEP 1: Get the lyrics using YouTube Music API. If not found, use SyncedLyrics API. If still not found, return None.
 
-def scrape_baseline_youtube(video_id: str, manual_synced=""):
+def _attempt_yt_music_scrape(video_id, location, language, manual_baseline, proxy_url, proxy_group):
+    """Runs a single YT Music scrape attempt through one proxy (or no proxy if proxy_url is None).
+
+    Returns (status, data) where status is one of:
+      "timed"        - got full time-synced lyrics -> data has df/title/artists
+      "manual"       - manual_baseline was provided -> data has title/artists/text
+      "untimed"      - got lyrics but no timestamps  -> data has title/artists/text
+      "no_lyrics"    - reached YT Music fine, no usable lyrics found
+      "no_watchlist" - couldn't even resolve the video_id through this proxy
+      "error"        - unexpected exception during this attempt
+    data is always a dict (possibly partially filled) or None for "error"/"no_watchlist".
+    """
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    if proxies:
+        log_gcp("INFO", "Proxy configuration loaded.", video_id=video_id, proxy_url=proxy_url, proxy_group=proxy_group)
+    else:
+        log_gcp("WARNING", "No proxy configuration found. Proceeding without proxy.", video_id=video_id, proxy_group=proxy_group)
+
+    s = requests.Session()
+    retry_strategy = Retry(
+        total=3, backoff_factor=1.5,
+        status_forcelist=[413, 429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.request = functools.partial(s.request, timeout=(40, 60))
+
+    ytmusic = YTMusic(location=location, language=language, proxies=proxies, requests_session=s)
+
+    try:
+        try:
+            watch_playlist = ytmusic.get_watch_playlist(videoId=video_id)
+        except Exception:
+            log_gcp("WARNING", f"Song could not be accessed. May be an invalid video_id...", video_id=video_id, location=location, language=language, traceback=traceback.format_exc())
+            return "no_watchlist", None
+
+        track_info = watch_playlist['tracks'][0]
+        title = track_info.get('title', 'Unknown Title')
+
+        artists_data = track_info.get('artists', [])
+        artists = ", ".join([a['name'] for a in artists_data]) if artists_data else "Unknown Artist"
+
+        # Extract track length to use for the final end_time in the fallback
+        length_ms = 0
+        if track_info.get('length'):
+            parts = track_info['length'].split(':')
+            if len(parts) == 2:
+                length_ms = int((int(parts[0]) * 60 + int(parts[1])) * 1000)
+
+        log_gcp("DEBUG", f"Attempting to pull lyrics for '{title}' by {artists}", video_id=video_id)
+
+        if manual_baseline:
+            log_gcp("INFO", "Manual baseline provided. Skipping YT Music scrape and forcing fallback...", video_id=video_id)
+            return "manual", {"title": title, "artists": artists, "length_ms": length_ms, "text": manual_baseline}
+
+        lyrics_id = watch_playlist.get('lyrics')
+        if not lyrics_id:
+            log_gcp("WARNING", "No lyrics returned for this song...", video_id=video_id)
+            return "no_lyrics", {"title": title, "artists": artists, "length_ms": length_ms}
+
+        try:
+            lyrics_data = ytmusic.get_lyrics(lyrics_id, timestamps=True)
+        except Exception:
+            log_gcp("WARNING", f"Lyrics found, but they are not time-synced...", video_id=video_id, traceback=traceback.format_exc())
+            ns_text = ""
+            try:
+                ns_data = ytmusic.get_lyrics(lyrics_id, timestamps=False)
+                if ns_data and 'lyrics' in ns_data:
+                    ns_text = ns_data['lyrics']
+            except Exception:
+                pass
+            if ns_text:
+                return "untimed", {"title": title, "artists": artists, "length_ms": length_ms, "text": ns_text}
+            return "no_lyrics", {"title": title, "artists": artists, "length_ms": length_ms}
+
+        if not lyrics_data:
+            log_gcp("WARNING", "No lyrics data returned for this song...", video_id=video_id)
+            return "no_lyrics", {"title": title, "artists": artists, "length_ms": length_ms}
+
+        raw_lyrics = lyrics_data.get('lyrics')
+        if not lyrics_data.get('hasTimestamps') or not isinstance(raw_lyrics, list):
+            log_gcp("WARNING", "get_lyrics(timestamps=True) returned untimed text without raising.", video_id=video_id)
+            if isinstance(raw_lyrics, str) and raw_lyrics:
+                return "untimed", {"title": title, "artists": artists, "length_ms": length_ms, "text": raw_lyrics}
+            return "no_lyrics", {"title": title, "artists": artists, "length_ms": length_ms}
+
+        df = pd.DataFrame(columns=['jp_baseline', 'start_time', 'end_time'])
+        for line in raw_lyrics:
+            df.loc[len(df)] = [line.text, line.start_time, line.end_time]
+
+        log_gcp("INFO", "Successfully generated YT Music baseline.", video_id=video_id)
+        return "timed", {"title": title, "artists": artists, "length_ms": length_ms, "df": df}
+
+    except Exception as e:
+        log_gcp("ERROR", f"YT Music extraction failed... {e}", traceback=traceback.format_exc(), video_id=video_id)
+        return "error", None
+
+
+def scrape_baseline_youtube(video_id: str, manual_baseline="", manual_synced=""):
     location = "PH"
     language = "en"
 
     log_gcp("INFO", f"Searching YouTube Music", video_id=video_id)
 
-    raw_proxies = [
-        os.environ.get("JP_PROXY_URL"),
+    jp_proxy_url = os.environ.get("JP_PROXY_URL")
+    ph_proxy_urls = [
         os.environ.get("PH_PROXY_URL_1"),
         os.environ.get("PH_PROXY_URL_2"),
         os.environ.get("PH_PROXY_URL_3"),
         os.environ.get("PH_PROXY_URL_4"),
         os.environ.get("PH_PROXY_URL_5"),
     ]
-    proxies_list = [{"http": p, "https": p} for p in raw_proxies if p]
-    proxies_list.append(None)
 
     error_thrown = False
-    
-    # NEW: Variables to track state across proxy attempts for the fallback
+
+    # Variables to track state across proxy attempts for the fallback
     non_synced_text = ""
     track_length_ms = 0
     final_title = ""
     final_artists = ""
 
-    for proxies in proxies_list:
-        if proxies:
-            log_gcp("INFO", "Proxy configuration loaded.", video_id=video_id, proxy_url=proxies["http"])
-        else:
-            log_gcp("WARNING", "No proxy configuration found. Proceeding without proxy.", video_id=video_id)
+    def record(data):
+        # Keep the best metadata/text found so far; never let a later empty
+        # attempt erase something usable an earlier attempt already found.
+        nonlocal non_synced_text, track_length_ms, final_title, final_artists
+        if not data:
+            return
+        if data.get("title"):
+            final_title = data["title"]
+        if data.get("artists"):
+            final_artists = data["artists"]
+        if data.get("length_ms"):
+            track_length_ms = data["length_ms"]
+        if data.get("text"):
+            non_synced_text = data["text"]
 
-        s = requests.Session()
-        retry_strategy = Retry(
-            total=3, backoff_factor=1.5, 
-            status_forcelist=[413, 429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        s.mount("http://", adapter)
-        s.mount("https://", adapter)
-        s.request = functools.partial(s.request, timeout=(40, 60))
-    
-        ytmusic = YTMusic(location=location, language=language, proxies=proxies, requests_session=s)
-
-        try:
-            try:
-                watch_playlist = ytmusic.get_watch_playlist(videoId=video_id)
-            except Exception as e:
-                log_gcp("WARNING", f"Song could not be accessed. May be an invalid video_id...", video_id=video_id, location=location, language=language, traceback=traceback.format_exc())
-                continue
-
-            track_info = watch_playlist['tracks'][0]
-            title = track_info.get('title', 'Unknown Title')
-            final_title = title
-
-            artists_data = track_info.get('artists', [])
-            artists = ", ".join([a['name'] for a in artists_data]) if artists_data else "Unknown Artist"
-            final_artists = artists
-
-            # NEW: Extract track length to use for the final end_time in the fallback
-            if track_info.get('length'):
-                parts = track_info['length'].split(':')
-                if len(parts) == 2:
-                    track_length_ms = int((int(parts[0]) * 60 + int(parts[1])) * 1000)
-
-            log_gcp("DEBUG", f"Attempting to pull lyrics for '{title}' by {artists}", video_id=video_id)
-
-            lyrics_id = watch_playlist.get('lyrics')
-            if not lyrics_id:
-                log_gcp("WARNING", "No lyrics returned for this song...", video_id=video_id)
-                continue
-            
-            try:
-                lyrics_data = ytmusic.get_lyrics(lyrics_id, timestamps=True)
-            except Exception as e:
-                log_gcp("WARNING", f"Lyrics found, but they are not time-synced...", video_id=video_id, traceback=traceback.format_exc())
-                # NEW: Save the non-timestamped lyrics to compare later in the fallback
-                try:
-                    ns_data = ytmusic.get_lyrics(lyrics_id, timestamps=False)
-                    if ns_data and 'lyrics' in ns_data:
-                        non_synced_text = ns_data['lyrics']
-                except Exception:
-                    pass
-                continue
-
-            if not lyrics_data:
-                log_gcp("WARNING", "No lyrics data returned for this song...", video_id=video_id)
-                continue
-
-            df = pd.DataFrame(columns=['jp_baseline', 'start_time', 'end_time'])
-            for line in lyrics_data.get('lyrics', []):
-                df.loc[len(df)] = [line.text, line.start_time, line.end_time]
-
-            log_gcp("INFO", "Successfully generated YT Music baseline.", video_id=video_id)
-            return df, title, artists
-
-        except Exception as e:
-            log_gcp("ERROR", f"YT Music extraction failed... {e}", traceback=traceback.format_exc(), video_id=video_id)
+    # ---- Phase 1: JP proxy, single attempt ----
+    stop_everything = False
+    if jp_proxy_url:
+        status, data = _attempt_yt_music_scrape(video_id, location, language, manual_baseline, jp_proxy_url, "JP")
+        record(data)
+        if status == "timed":
+            return data["df"], data["title"], data["artists"]
+        if status == "manual":
+            stop_everything = True
+        if status == "error":
             error_thrown = True
-            continue
+        # "untimed" / "no_lyrics" / "no_watchlist" -> always move on to the PH proxies
+    else:
+        log_gcp("WARNING", "No JP proxy configured. Skipping JP attempt.", video_id=video_id)
+
+    # ---- Phase 2: PH proxies, tried in order, direct connection as the final fallback ----
+    if not stop_everything:
+        ph_attempts = [p for p in ph_proxy_urls if p]
+        ph_attempts.append(None)  # last resort: no proxy at all
+
+        for proxy_url in ph_attempts:
+            status, data = _attempt_yt_music_scrape(video_id, location, language, manual_baseline, proxy_url, "PH")
+            record(data)
+            if status == "timed":
+                return data["df"], data["title"], data["artists"]
+            if status in ("manual", "untimed"):
+                # Got something usable (even if unsynced) - stop burning redundant
+                # PH proxies and go straight to the syncedlyrics fallback below.
+                break
+            if status == "error":
+                error_thrown = True
+            # "no_lyrics" / "no_watchlist" -> try the next PH proxy
 
     # NEW: Fallback Logic Execution
     if non_synced_text:
@@ -184,22 +254,27 @@ def scrape_baseline_youtube(video_id: str, manual_synced=""):
         clean_title = re.sub(r'\(feat\..*?\)', '', clean_title, flags=re.IGNORECASE).strip()
         primary_title = clean_title.split(" - ")[0].strip()
 
-        search_query_full = f"{primary_title} {final_artists}".strip()
-        search_query_title = f"{primary_title}".strip()
-        search_query_full_2 = f"{primary_title} {final_artists}".strip()
-        search_query_title_2 = f"{primary_title}".strip()
-
-        lrc_string = syncedlyrics.search(search_query_full, synced_only=True, providers=["Lrclib"], lang="en")
-        if not lrc_string:
-            lrc_string = syncedlyrics.search(search_query_title, synced_only=True, providers=["Lrclib"], lang="en")
-        if not lrc_string:
-            lrc_string = syncedlyrics.search(search_query_full_2, synced_only=True, providers=["Lrclib"], lang="en")
-        if not lrc_string:
-            lrc_string = syncedlyrics.search(search_query_title_2, synced_only=True, providers=["Lrclib"], lang="en")
-        if not lrc_string and manual_synced.strip():
-            lrc_string = syncedlyrics.search(manual_synced, synced_only=True, providers=["Lrclib"], lang="en")
+        # Build list of queries to try sequentially
+        search_queries = [
+            f"{primary_title} {final_artists}".strip(),
+            f"{primary_title}".strip(),
+            f"{final_title} {final_artists}".strip(),
+            f"{final_title}".strip()
+        ]
+        
+        if manual_synced.strip():
+            search_queries.append(manual_synced.strip())
             
-        if lrc_string:
+        # Deduplicate queries to avoid redundant searches
+        search_queries = list(dict.fromkeys(search_queries))
+
+        for query in search_queries:
+            log_gcp("DEBUG", f"Attempting syncedlyrics on query: {query}", video_id=video_id)
+            lrc_string = syncedlyrics.search(query, synced_only=True, providers=["Lrclib"], lang="en")
+            
+            if not lrc_string:
+                continue
+                
             parsed_lines = []
             
             # Parse LRC string into (text, start_time_ms)
@@ -231,10 +306,12 @@ def scrape_baseline_youtube(video_id: str, manual_synced=""):
                     df.loc[len(df)] = [text, start_time, end_time]
                     
                 return df, final_title, final_artists
+            
             else:
-                log_gcp("WARNING", f"Fallback lyrics failed match threshold ({match_pct:.2f}%).", video_id=video_id)
-        else:
-            log_gcp("WARNING", f"SyncedLyrics failed to find synced lyrics.", video_id=video_id)
+                log_gcp("WARNING", f"Fallback lyrics for '{query}' failed match threshold ({match_pct:.2f}%). Trying next query...", video_id=video_id)
+
+        # If loop finishes without returning, all queries failed
+        log_gcp("WARNING", f"SyncedLyrics failed to find a valid synced match.", video_id=video_id)
 
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("syncedlyrics").setLevel(logging.WARNING)
